@@ -550,6 +550,7 @@ pub fn TreeType(
             };
 
             const filter = struct {
+                /// Maximum number of data blocks serviced by a single filter block.
                 const data_block_count_max = layout.filter_data_block_count_max;
 
                 const filter_offset = @sizeOf(vsr.Header);
@@ -881,6 +882,10 @@ pub fn TreeType(
                     }
                 }
 
+                return data_block_search(data_block, key);
+            }
+
+            fn data_block_search(data_block: BlockPtrConst, key: Key) ?*const Value {
                 assert(@divExact(data.key_layout_size, key_size) == data.key_count + 1);
                 const key_layout_bytes = @alignCast(
                     @alignOf(Key),
@@ -1194,7 +1199,21 @@ pub fn TreeType(
                 );
             }
 
+            inline fn index_data_addresses_const(index_block: BlockPtrConst) []const u64 {
+                return mem.bytesAsSlice(
+                    u64,
+                    index_block[index.data_addresses_offset..][0..index.data_addresses_size],
+                );
+            }
+
             inline fn index_data_checksums(index_block: BlockPtr) []u128 {
+                return mem.bytesAsSlice(
+                    u128,
+                    index_block[index.data_checksums_offset..][0..index.data_checksums_size],
+                );
+            }
+
+            inline fn index_data_checksums_const(index_block: BlockPtrConst) []const u128 {
                 return mem.bytesAsSlice(
                     u128,
                     index_block[index.data_checksums_offset..][0..index.data_checksums_size],
@@ -1208,7 +1227,21 @@ pub fn TreeType(
                 );
             }
 
+            inline fn index_filter_addresses_const(index_block: BlockPtrConst) []const u64 {
+                return mem.bytesAsSlice(
+                    u64,
+                    index_block[index.filter_addresses_offset..][0..index.filter_addresses_size],
+                );
+            }
+
             inline fn index_filter_checksums(index_block: BlockPtr) []u128 {
+                return mem.bytesAsSlice(
+                    u128,
+                    index_block[index.filter_checksums_offset..][0..index.filter_checksums_size],
+                );
+            }
+
+            inline fn index_filter_checksums_const(index_block: BlockPtrConst) []const u128 {
                 return mem.bytesAsSlice(
                     u128,
                     index_block[index.filter_checksums_offset..][0..index.filter_checksums_size],
@@ -1269,13 +1302,17 @@ pub fn TreeType(
                 );
             }
 
-            inline fn data_block_values_used(data_block: BlockPtr) []const Value {
+            inline fn data_block_values_used(data_block: BlockPtrConst) []const Value {
                 const header = mem.bytesAsValue(vsr.Header, data_block[0..@sizeOf(vsr.Header)]);
                 // TODO we should be able to cross-check this with the header size
                 // for more safety.
-                const used = @intCast(u32, header.request);
-                assert(used <= data.value_count_max);
-                return data_block_values(data_block)[0..used];
+                const values_used = @intCast(u32, header.request);
+                assert(values_used <= data.value_count_max);
+                const values = mem.bytesAsSlice(
+                    Value,
+                    data_block[data.values_offset..][0..data.values_size],
+                );
+                return values[0..values_used];
             }
 
             inline fn block_address(block: BlockPtrConst) u64 {
@@ -1286,6 +1323,10 @@ pub fn TreeType(
             }
 
             inline fn filter_block_filter(filter_block: BlockPtr) []u8 {
+                return filter_block[filter.filter_offset..][0..filter.filter_size];
+            }
+
+            inline fn filter_block_filter_const(filter_block: BlockPtrConst) []const u8 {
                 return filter_block[filter.filter_offset..][0..filter.filter_size];
             }
 
@@ -2281,7 +2322,13 @@ pub fn TreeType(
             tree.mutable_table.remove(key);
         }
 
-        pub fn lookup(tree: *Tree, snapshot: u64, key: Key, callback: fn (value: ?*const Value) void) void {
+        pub fn lookup_value(
+            tree: *Tree,
+            callback: fn (*Lookup, ?*const Value) void,
+            lookup: *Lookup,
+            snapshot: u64,
+            key: Key,
+        ) void {
             assert(tree.prefetch_keys.count() == 0);
             assert(tree.prefetch_keys_iterator == null);
 
@@ -2295,7 +2342,7 @@ pub fn TreeType(
                 if (tree.mutable_table.get(key) orelse
                     tree.value_cache.?.getKeyPtr(tombstone_from_key(key))) |value|
                 {
-                    callback(unwrap_tombstone(value));
+                    callback(lookup, unwrap_tombstone(value));
                     return;
                 }
             }
@@ -2305,23 +2352,108 @@ pub fn TreeType(
 
             if (!tree.table.free and tree.table.info.visible(snapshot)) {
                 if (tree.table.get(key, fingerprint)) |value| {
-                    callback(unwrap_tombstone(value));
+                    callback(lookup, unwrap_tombstone(value));
                     return;
                 }
             }
 
-            var it = tree.manifest.lookup(snapshot, key);
-            if (it.next()) |info| {
-                assert(info.visible(snapshot));
-                assert(compare_keys(key, info.key_min) != .lt);
-                assert(compare_keys(key, info.key_max) != .gt);
+            lookup.* = .{
+                .tree = tree,
+                .completion = undefined,
+                .fingerprint = fingerprint,
+                .it = tree.manifest.lookup(snapshot, key),
+                .callback = callback,
+            };
 
-                // TODO
-            } else {
-                callback(null);
-                return;
-            }
+            lookup.read_next_table();
         }
+
+        const Lookup = struct {
+            tree: *Tree,
+            completion: Grid.Read,
+            fingerprint: bloom_filter.Fingerprint,
+            it: Manifest.LookupIterator,
+
+            current_table: ?struct {
+                data_block_address: u64,
+                data_block_checksum: u128,
+            } = null,
+
+            callback: fn (*Tree.Lookup, ?*const Value) void,
+
+            fn finish(lookup: *Lookup, value: ?*const Value) void {
+                const callback = lookup.callback;
+                lookup.* = undefined;
+                callback(lookup, value);
+            }
+
+            fn read_next_table(lookup: *Lookup) void {
+                assert(lookup.current_table == null);
+                const info = lookup.it.next() orelse {
+                    lookup.finish(null);
+                    return;
+                };
+
+                assert(info.visible(lookup.it.snapshot));
+                assert(compare_keys(lookup.it.key, info.key_min) != .lt);
+                assert(compare_keys(lookup.it.key, info.key_max) != .gt);
+
+                lookup.tree.grid.read_block(
+                    read_index_callback,
+                    &lookup.completion,
+                    info.address,
+                    info.checksum,
+                );
+            }
+
+            fn read_index_callback(completion: *Grid.Read, index: BlockPtrConst) void {
+                const lookup = @fieldParentPtr(Lookup, "completion", completion);
+                const data_block_index = Table.index_data_block_for_key(index, lookup.it.key);
+                const filter_block_index = data_block_index / Table.filter.data_block_count_max;
+
+                lookup.current_table = .{
+                    .data_block_address = Table.index_data_addresses_const(index)[data_block_index],
+                    .data_block_checksum = Table.index_data_checksums_const(index)[data_block_index],
+                };
+
+                lookup.tree.grid.read_block(
+                    read_filter_callback,
+                    completion,
+                    Table.index_filter_addresses_const(index)[filter_block_index],
+                    Table.index_filter_checksums_const(index)[filter_block_index],
+                );
+            }
+
+            fn read_filter_callback(completion: *Grid.Read, filter_block: BlockPtrConst) void {
+                const lookup = @fieldParentPtr(Lookup, "completion", completion);
+
+                const filter_bytes = Table.filter_block_filter_const(filter_block);
+                if (bloom_filter.may_contain(lookup.fingerprint, filter_bytes)) {
+                    lookup.tree.grid.read_block(
+                        read_data_callback,
+                        completion,
+                        lookup.current_table.?.data_block_address,
+                        lookup.current_table.?.data_block_checksum,
+                    );
+                } else {
+                    // The key is not present in this table, move on.
+                    lookup.current_table = null;
+                    lookup.read_next_table();
+                }
+            }
+
+            fn read_data_callback(completion: *Grid.Read, data_block: BlockPtrConst) void {
+                const lookup = @fieldParentPtr(Lookup, "completion", completion);
+
+                if (Table.data_block_search(data_block, lookup.it.key)) |value| {
+                    lookup.finish(value);
+                } else {
+                    // The key is not present in this table, move on.
+                    lookup.current_table = null;
+                    lookup.read_next_table();
+                }
+            }
+        };
 
         /// Returns null if the value is null or a tombstone, otherwise returns the value.
         /// We use tombstone values internally, but expose them as null to the user.
@@ -2593,7 +2725,7 @@ pub fn main() !void {
     _ = tree.get;
     _ = tree.put;
     _ = tree.remove;
-    _ = tree.lookup;
+    _ = tree.lookup_value;
     _ = tree.manifest;
     _ = tree.manifest.lookup;
     _ = tree.flush;
